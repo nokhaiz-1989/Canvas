@@ -241,8 +241,8 @@ def draw_room():
         height=CANVAS_HEIGHT,
         width=CANVAS_WIDTH,
         drawing_mode="freedraw",
+        return_image_data=True,
         key=f"canvas_{team_id}",
-        display_toolbar=True,
     )
 
     c1, c2 = st.columns(2)
