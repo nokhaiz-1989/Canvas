@@ -1,23 +1,35 @@
-import io
-import random
-import time
-from datetime import datetime
+"""
+OUTCOME DRAWING ICEBREAKER
+--------------------------
+A standalone warm-up exercise, separate from the OBE Level-Up pyramid game.
+
+Teams draw a house with deliberately vague instructions and NO rubric.
+When every team has submitted, the facilitator reveals a simple rubric
+(1 door, 1 window, 1 chimney) live on the projector. Because teams never
+saw the rubric while drawing, their houses vary wildly and rarely satisfy
+it cleanly — which is the whole point: this is what happens when a
+learning outcome isn't defined before the task begins.
+
+Run with:
+    streamlit run outcome_drawing_icebreaker.py
+
+Needs one extra package beyond the base game:
+    pip install streamlit-drawable-canvas
+"""
 
 import streamlit as st
-from PIL import Image
+import streamlit.components.v1 as components
+import time
+import base64
+import io
+
 from streamlit_autorefresh import st_autorefresh
 from streamlit_drawable_canvas import st_canvas
+from PIL import Image
 
-st.set_page_config(
-    page_title="OBE Icebreaker — Draw & Share",
-    page_icon="🎨",
-    layout="wide",
-)
+st.set_page_config(page_title="Draw the House", page_icon="🏠", layout="wide")
 
-# -----------------------------
-# Shared multiplayer state
-# -----------------------------
-TEAM_NAMES = {
+DEFAULT_TEAM_NAMES = {
     1: "Team Alpha",
     2: "Team Bravo",
     3: "Team Charlie",
@@ -26,332 +38,487 @@ TEAM_NAMES = {
     6: "Team Fifa",
 }
 
-PROMPT = "Draw a house in 10 seconds."
-INSTRUCTION = "Do not discuss with other teams. Everyone receives exactly the same instruction."
-CANVAS_WIDTH = 650
-CANVAS_HEIGHT = 430
+# The rubric is intentionally never shown to teams before they draw.
+# Change these freely — the exercise works with any short checklist.
+RUBRIC = [
+    "Exactly 1 door",
+    "Exactly 1 window",
+    "Exactly 1 chimney",
+]
+
+DRAW_SECONDS = 180  # 3-minute default drawing window
+CANVAS_HEIGHT = 380
+CANVAS_WIDTH = 460
+
+
+def flat_html(s):
+    """Collapse a pretty-printed, indented multi-line HTML string down to a
+    single line with no leading whitespace on any part.
+
+    st.markdown renders unsafe_allow_html content through a Markdown parser
+    first, and Markdown treats a line indented 4+ spaces as a code block —
+    a naturally-indented Python f-string trips that rule and prints raw
+    HTML tags as literal text instead of rendering them. Flattening avoids
+    it entirely.
+    """
+    return " ".join(line.strip() for line in s.strip().splitlines())
 
 
 @st.cache_resource
 def get_shared_state():
+    """One object shared by every browser session, the same trick used in
+    the pyramid game: st.session_state is per-device, so a team's drawing
+    would never reach the facilitator's screen without this."""
     return {
-        i: {
-            "name": TEAM_NAMES[i],
-            "drawing": None,
-            "submitted": False,
-            "submitted_at": None,
-        }
-        for i in range(1, 7)
+        "start_time": None,      # set when facilitator starts the timer
+        "rubric_revealed": False,
+        "teams": {
+            i: {
+                "name": DEFAULT_TEAM_NAMES[i],
+                "submitted": False,
+                "image_b64": None,
+                "marks": {item: None for item in RUBRIC},  # facilitator-judged
+            }
+            for i in range(1, 7)
+        },
     }
 
 
-teams = get_shared_state()
+state = get_shared_state()
+teams = state["teams"]
 
 if "page" not in st.session_state:
     st.session_state.page = "home"
-if "team_id" not in st.session_state:
-    st.session_state.team_id = None
 
-# -----------------------------
-# Styling helpers
-# -----------------------------
+if "team" not in st.session_state:
+    st.session_state.team = None
+
+
 def inject_css():
     st.markdown(
-        """
+        flat_html("""
         <style>
-        .block-container {padding-top: 1.2rem; padding-bottom: 1rem;}
-        .hero {
-            text-align:center; padding: 8px 10px 16px;
+        .block-container { max-width:100% !important; padding:1.2rem 2rem !important; }
+        .ib-header {
+            background:#101534; border-radius:16px; padding:16px 24px;
+            margin-bottom:16px; text-align:center;
         }
-        .hero h1 {
-            font-size: 46px; margin:0; font-weight:900; letter-spacing:-1px;
+        .ib-title {
+            font-family:'Trebuchet MS', sans-serif; font-size:32px;
+            font-weight:800; color:#FFFFFF; margin:0;
         }
-        .hero p {
-            font-size:20px; color:#666; margin:8px 0 0;
+        .ib-sub { font-size:15px; color:#98A2D8; margin-top:4px; }
+        .timer-big {
+            font-family:'Trebuchet MS', sans-serif; font-size:54px;
+            font-weight:800; text-align:center; border-radius:16px;
+            padding:10px; margin-bottom:14px;
         }
-        .prompt-box {
-            border:3px solid #4C6EF5; border-radius:22px;
-            padding:22px 24px; background:#F8F9FA; text-align:center;
-            box-shadow:0 8px 24px rgba(0,0,0,.08); margin:8px 0 18px;
+        .gallery-card {
+            background:#FFFFFF; border:3px solid #101534; border-radius:14px;
+            padding:10px; text-align:center; box-shadow:0 5px 0 #101534;
+            margin-bottom:14px;
         }
-        .prompt-main {font-size:34px; font-weight:900;}
-        .prompt-sub {font-size:17px; color:#555; margin-top:7px;}
-        .timer {
-            font-size:42px; font-weight:900; text-align:center;
-            padding:8px; border-radius:16px; background:#FFF4E6;
-            border:2px solid #FFD8A8;
+        .gallery-name { font-weight:800; font-size:17px; color:#101534; margin-bottom:6px; }
+        .gallery-empty {
+            color:#ADB5BD; font-style:italic; padding:40px 0; font-size:15px;
         }
-        .team-card {
-            border:2px solid #DEE2E6; border-radius:18px; padding:12px;
-            background:#FFF; box-shadow:0 4px 12px rgba(0,0,0,.06);
+        .rubric-box {
+            background:#FFF3BF; border:3px solid #F59F00; border-radius:16px;
+            padding:18px 22px; margin-bottom:16px;
         }
-        .team-card.done {border-color:#40C057; background:#F4FCE3;}
-        .team-name {font-size:20px; font-weight:900;}
-        .team-status {font-size:14px; font-weight:800; margin-top:4px;}
-        .reveal-title {
-            text-align:center; font-size:38px; font-weight:900; margin:12px 0 4px;
+        .rubric-title {
+            font-family:'Trebuchet MS', sans-serif; font-size:22px;
+            font-weight:800; color:#8A6100; margin-bottom:8px;
         }
-        .reveal-sub {text-align:center; color:#666; font-size:18px; margin-bottom:15px;}
-        .connection {
-            text-align:center; font-size:26px; font-weight:900;
-            padding:15px 20px; border-radius:18px; background:#E7F5FF;
-            border:2px solid #74C0FC; margin-top:18px;
+        .rubric-item { font-size:19px; color:#5C4500; margin:4px 0; }
+        .moral-box {
+            background:#101534; color:#FFFFFF; border-radius:16px;
+            padding:20px 26px; font-size:20px; line-height:1.55;
         }
-        .step-card {
-            text-align:center; padding:18px; border-radius:16px;
-            border:2px solid #DEE2E6; background:#F8F9FA;
-            min-height:135px;
+        .tally-pill {
+            display:inline-block; padding:4px 12px; border-radius:999px;
+            font-size:14px; font-weight:800; margin:3px 4px 0 0;
         }
-        .step-number {font-size:28px; font-weight:900;}
-        .step-title {font-size:18px; font-weight:900; margin-top:4px;}
-        .step-desc {font-size:14px; color:#666; margin-top:5px; line-height:1.3;}
         </style>
-        """,
-        unsafe_allow_html=True,
+        """),
+        unsafe_allow_html=True
     )
 
 
-def drawing_to_png_bytes(image_data):
-    if image_data is None:
-        return None
-    image = Image.fromarray(image_data.astype("uint8"), mode="RGBA")
-    buffer = io.BytesIO()
-    image.save(buffer, format="PNG")
-    return buffer.getvalue()
-
-
-def reset_all():
-    for team in teams.values():
-        team["drawing"] = None
-        team["submitted"] = False
-        team["submitted_at"] = None
-
-
-# -----------------------------
-# Pages
-# -----------------------------
-def home():
+def header(subtitle):
     st.markdown(
+        flat_html(f"""
+        <div class="ib-header">
+            <div class="ib-title">🏠 DRAW THE HOUSE</div>
+            <div class="ib-sub">{subtitle}</div>
+        </div>
+        """),
+        unsafe_allow_html=True
+    )
+
+
+def image_from_canvas(image_data):
+    """Convert the canvas RGBA numpy array to a base64 PNG for storage in
+    the shared dict, so every browser (including the facilitator's) can
+    display it without re-running any drawing code."""
+    img = Image.fromarray(image_data.astype("uint8"), "RGBA")
+
+    # Flatten onto white so transparent canvas background doesn't turn black
+    bg = Image.new("RGBA", img.size, (255, 255, 255, 255))
+    bg.paste(img, mask=img)
+
+    buf = io.BytesIO()
+    bg.convert("RGB").save(buf, format="PNG")
+    return base64.b64encode(buf.getvalue()).decode()
+
+
+def celebrate_submit():
+    components.html(
         """
-        <div class="hero">
-            <h1>🎨 DRAW & SHARE</h1>
-            <p>A 3-minute OBE icebreaker for teams</p>
-        </div>
+        <script src="https://cdnjs.cloudflare.com/ajax/libs/canvas-confetti/1.9.2/confetti.browser.min.js"></script>
+        <script>
+        (function () {
+            function fire() {
+                if (typeof confetti === 'function') {
+                    confetti({particleCount: 90, spread: 80, origin: {y: 0.4}});
+                } else { setTimeout(fire, 100); }
+            }
+            fire();
+        })();
+        </script>
         """,
-        unsafe_allow_html=True,
+        height=1,
     )
 
-    st.markdown(
-        f"""
-        <div class="prompt-box">
-            <div class="prompt-main">🏠 {PROMPT}</div>
-            <div class="prompt-sub">{INSTRUCTION}</div>
-        </div>
-        """,
-        unsafe_allow_html=True,
+
+# --------------------------------------------------------------------------
+# Pages
+# --------------------------------------------------------------------------
+def home():
+    inject_css()
+    header("A warm-up before we talk about learning outcomes")
+
+    st.info(
+        "Every team will draw a house. That's the only instruction you'll get "
+        "right now. Once everyone submits, we'll reveal something you didn't "
+        "know while drawing."
     )
 
-    col1, col2 = st.columns(2)
-    with col1:
-        if st.button("🎨 JOIN AS A TEAM", type="primary", use_container_width=True):
+    a, b = st.columns(2)
+
+    with a:
+        if st.button("🎨 JOIN AS TEAM", use_container_width=True, type="primary"):
             st.session_state.page = "join"
             st.rerun()
-    with col2:
-        if st.button("📺 PRESENTER / SHARE SCREEN", use_container_width=True):
-            st.session_state.page = "presenter"
-            st.rerun()
 
-    st.divider()
-    st.markdown("### How the activity works")
-    cols = st.columns(3)
-    steps = [
-        ("1", "DRAW", "Each team draws its own version of the house."),
-        ("2", "SUBMIT", "The team's drawing is saved centrally."),
-        ("3", "REVEAL", "You show every team's drawing together on the projector."),
-    ]
-    for col, (num, title, desc) in zip(cols, steps):
-        with col:
-            st.markdown(
-                f"""
-                <div class="step-card">
-                    <div class="step-number">{num}</div>
-                    <div class="step-title">{title}</div>
-                    <div class="step-desc">{desc}</div>
-                </div>
-                """,
-                unsafe_allow_html=True,
-            )
+    with b:
+        if st.button("📺 FACILITATOR VIEW", use_container_width=True):
+            st.session_state.page = "facilitator"
+            st.rerun()
 
 
 def join():
-    st.markdown("## 👥 Choose Your Team")
-    st.caption("Use one device per team. Team members can collaborate on the same device.")
+    inject_css()
+    header("Join the warm-up")
 
-    team_id = st.selectbox(
-        "Team",
-        list(TEAM_NAMES.keys()),
-        format_func=lambda i: TEAM_NAMES[i],
-    )
+    team = st.selectbox("Select your team", [t["name"] for t in teams.values()])
+    team_id = next(i for i, tm in teams.items() if tm["name"] == team)
 
-    team = teams[team_id]
-    if team["submitted"]:
-        st.success(f"✅ {team['name']} has already submitted a drawing. You can reopen it below.")
-    else:
-        st.info(f"{team['name']} is ready to draw!")
-
-    if st.button("ENTER DRAWING ROOM", type="primary", use_container_width=True):
-        st.session_state.team_id = team_id
+    if st.button("ENTER", type="primary", use_container_width=True):
+        st.session_state.team = team_id
         st.session_state.page = "draw"
         st.rerun()
 
-    if st.button("← Home"):
+    if st.button("← Back"):
         st.session_state.page = "home"
         st.rerun()
 
 
-def draw_room():
-    team_id = st.session_state.team_id
-    team = teams[team_id]
+def time_left():
+    if state["start_time"] is None:
+        return None
+    elapsed = time.time() - state["start_time"]
+    return max(0, DRAW_SECONDS - elapsed)
 
-    st.markdown(
-        f"<div class='hero'><h1>🎨 {team['name']}</h1><p>Get ready. Think fast. Draw!</p></div>",
-        unsafe_allow_html=True,
-    )
 
-    st.markdown(
-        f"""
-        <div class="prompt-box">
-            <div class="prompt-main">🏠 {PROMPT}</div>
-            <div class="prompt-sub">{INSTRUCTION}</div>
-        </div>
-        """,
-        unsafe_allow_html=True,
-    )
+def draw_page():
+    inject_css()
 
-    st.warning("⏱️ Suggested facilitator countdown: 10 seconds. Start when everyone is ready.")
+    team_id = st.session_state.team
+    t = teams[team_id]
 
-    stroke_width = st.slider("Pen size", 2, 12, 5)
-    drawing_color = st.color_picker("Pen color", "#111111")
+    header(f"{t['name']} — draw a house. Go with your own style.")
 
-    canvas_result = st_canvas(
-        fill_color="rgba(255, 255, 255, 0)",
-        stroke_width=stroke_width,
-        stroke_color=drawing_color,
-        background_color="#FFFFFF",
-        height=CANVAS_HEIGHT,
-        width=CANVAS_WIDTH,
-        drawing_mode="freedraw",
-        return_image_data=True,
-        key=f"canvas_{team_id}",
-    )
+    st_autorefresh(interval=1000, key="draw_timer_refresh")
 
-    c1, c2 = st.columns(2)
-    with c1:
-        if st.button("✅ SUBMIT TEAM DRAWING", type="primary", use_container_width=True):
-            png_bytes = drawing_to_png_bytes(canvas_result.image_data)
-            if png_bytes:
-                team["drawing"] = png_bytes
-                team["submitted"] = True
-                team["submitted_at"] = datetime.now().strftime("%H:%M:%S")
-                st.success("🎉 Drawing submitted! Check the presenter screen.")
-                time.sleep(0.5)
+    remaining = time_left()
+
+    if remaining is None:
+        st.markdown(
+            flat_html("""
+            <div class="timer-big" style="background:#E9ECEF;color:#868E96;">
+                Waiting for the facilitator to start the timer
+            </div>
+            """),
+            unsafe_allow_html=True
+        )
+    elif remaining > 0:
+        mins, secs = divmod(int(remaining), 60)
+        color = "#FFF3BF" if remaining > 30 else "#FFE3E3"
+        text_color = "#8A6100" if remaining > 30 else "#C92A2A"
+        st.markdown(
+            flat_html(f"""
+            <div class="timer-big" style="background:{color};color:{text_color};">
+                ⏱ {mins:01d}:{secs:02d}
+            </div>
+            """),
+            unsafe_allow_html=True
+        )
+    else:
+        st.markdown(
+            flat_html("""
+            <div class="timer-big" style="background:#FFE3E3;color:#C92A2A;">
+                ⏱ TIME'S UP — submit what you have
+            </div>
+            """),
+            unsafe_allow_html=True
+        )
+
+    if t["submitted"]:
+        st.success("Your house is submitted. Sit tight for the reveal.")
+        st.image(
+            Image.open(io.BytesIO(base64.b64decode(t["image_b64"]))),
+            width=CANVAS_WIDTH
+        )
+
+        if st.button("↺ Redraw (clears your submission)"):
+            t["submitted"] = False
+            t["image_b64"] = None
+            st.rerun()
+
+    else:
+        canvas_result = st_canvas(
+            fill_color="rgba(0,0,0,0)",
+            stroke_width=4,
+            stroke_color="#101534",
+            background_color="#FFFFFF",
+            height=CANVAS_HEIGHT,
+            width=CANVAS_WIDTH,
+            drawing_mode="freedraw",
+            key=f"canvas_{team_id}",
+        )
+
+        if st.button("🚀 Submit my house", type="primary", use_container_width=True):
+
+            if canvas_result.image_data is not None:
+                t["image_b64"] = image_from_canvas(canvas_result.image_data)
+                t["submitted"] = True
+                celebrate_submit()
                 st.rerun()
             else:
-                st.error("Please draw something before submitting.")
+                st.warning("Draw something first!")
+
+    if st.button("← Leave"):
+        st.session_state.page = "home"
+        st.rerun()
+
+
+def facilitator():
+    inject_css()
+    st_autorefresh(interval=2000, key="facilitator_refresh")
+
+    header("Facilitator view — live gallery and rubric reveal")
+
+    remaining = time_left()
+
+    c1, c2, c3 = st.columns(3)
+
+    with c1:
+        if state["start_time"] is None:
+            if st.button("▶ Start 3-minute timer", type="primary", use_container_width=True):
+                state["start_time"] = time.time()
+                st.rerun()
+        else:
+            if st.button("↺ Reset timer", use_container_width=True):
+                state["start_time"] = None
+                st.rerun()
+
     with c2:
-        if st.button("📺 Go to Presenter Screen", use_container_width=True):
-            st.session_state.page = "presenter"
+        submitted_count = sum(1 for tm in teams.values() if tm["submitted"])
+        st.metric("Submitted", f"{submitted_count} / {len(teams)}")
+
+    with c3:
+        if remaining is not None:
+            mins, secs = divmod(int(remaining), 60)
+            label = f"{mins:01d}:{secs:02d}" if remaining > 0 else "Time's up"
+            st.metric("Time left", label)
+        else:
+            st.metric("Time left", "—")
+
+    st.divider()
+
+    # ---- Live gallery ----
+    st.subheader("🖼️ Live gallery")
+
+    cols = st.columns(3)
+
+    for idx, (i, t) in enumerate(teams.items()):
+        with cols[idx % 3]:
+            if t["submitted"]:
+                st.markdown(
+                    f"<div class='gallery-card'><div class='gallery-name'>{t['name']}</div>",
+                    unsafe_allow_html=True
+                )
+                st.image(
+                    Image.open(io.BytesIO(base64.b64decode(t["image_b64"]))),
+                    use_container_width=True
+                )
+                st.markdown("</div>", unsafe_allow_html=True)
+            else:
+                st.markdown(
+                    flat_html(f"""
+                    <div class="gallery-card">
+                        <div class="gallery-name">{t['name']}</div>
+                        <div class="gallery-empty">Still drawing…</div>
+                    </div>
+                    """),
+                    unsafe_allow_html=True
+                )
+
+    st.divider()
+
+    # ---- Rubric reveal ----
+    st.subheader("📋 The rubric nobody saw")
+
+    if not state["rubric_revealed"]:
+        st.warning(
+            "Reveal this only once every team has submitted — that's the moment "
+            "the exercise lands."
+        )
+        if st.button("🎭 REVEAL THE RUBRIC", type="primary", use_container_width=True):
+            state["rubric_revealed"] = True
             st.rerun()
 
-    if team["submitted"]:
-        st.info(f"Your drawing was submitted at {team['submitted_at']}. You may draw again and resubmit to replace it.")
-
-
-def presenter():
-    # Refresh automatically so drawings appear as teams submit them.
-    st_autorefresh(interval=2000, key="icebreaker_presenter_refresh")
-
-    submitted_count = sum(t["submitted"] for t in teams.values())
-
-    st.markdown(
-        """
-        <div class="hero">
-            <h1>📺 TEAM DRAWING REVEAL</h1>
-            <p>Watch the teams' interpretations appear live.</p>
-        </div>
-        """,
-        unsafe_allow_html=True,
-    )
-
-    st.markdown(
-        f"<div class='reveal-sub'><b>{submitted_count}/6 teams</b> have submitted</div>",
-        unsafe_allow_html=True,
-    )
-
-    if submitted_count == 0:
-        st.info("Waiting for the teams to submit their drawings…")
     else:
-        # Six-team projector layout: 3 x 2.
-        for row in range(2):
-            cols = st.columns(3)
-            for col, team_id in zip(cols, range(row * 3 + 1, row * 3 + 4)):
-                team = teams[team_id]
-                with col:
-                    card_class = "team-card done" if team["submitted"] else "team-card"
-                    status = "✅ SUBMITTED" if team["submitted"] else "⏳ WAITING"
-                    st.markdown(
-                        f"""
-                        <div class="{card_class}">
-                            <div class="team-name">{team['name']}</div>
-                            <div class="team-status">{status}</div>
-                        </div>
-                        """,
-                        unsafe_allow_html=True,
+        st.markdown(
+            flat_html(f"""
+            <div class="rubric-box">
+                <div class="rubric-title">The rubric was:</div>
+                {"".join(f"<div class='rubric-item'>✔ {item}</div>" for item in RUBRIC)}
+            </div>
+            """),
+            unsafe_allow_html=True
+        )
+
+        st.caption(
+            "For each team's drawing, mark whether it happens to meet each "
+            "rubric item — this is for discussion, judged by eye, not auto-graded."
+        )
+
+        full_match = 0
+        judged = 0
+
+        for i, t in teams.items():
+
+            if not t["submitted"]:
+                continue
+
+            with st.expander(f"{t['name']}", expanded=False):
+
+                left, right = st.columns([1, 1])
+
+                with left:
+                    st.image(
+                        Image.open(io.BytesIO(base64.b64decode(t["image_b64"]))),
+                        use_container_width=True
                     )
-                    if team["drawing"]:
-                        st.image(team["drawing"], use_container_width=True)
-                    else:
-                        st.markdown("<div style='height:300px;display:flex;align-items:center;justify-content:center;border:2px dashed #DEE2E6;border-radius:14px;color:#999;'>Waiting for drawing…</div>", unsafe_allow_html=True)
 
-    st.markdown(
-        """
-        <div class="connection">
-            Same instruction → different results → <b>WHY?</b>
-        </div>
-        """,
-        unsafe_allow_html=True,
-    )
+                with right:
+                    hits = 0
+                    any_judged = False
 
-    st.markdown("### 💡 Debrief: connect it to OBE")
-    st.write(
-        "Ask: “I gave every team the same instruction. Why are the results different? "
-        "What was missing from the instruction? What would make the expected result clearer?"
-    )
-    st.markdown(
-        "**Transition:** Clear expectations lead to clearer learning outcomes, better-designed activities, and assessments that actually measure the intended learning."
-    )
+                    for item in RUBRIC:
+                        current = t["marks"][item]
+                        choice = st.radio(
+                            item,
+                            ["Not judged", "✅ Meets it", "❌ Misses it"],
+                            index={"Not judged": 0, True: 1, False: 2}.get(
+                                "Not judged" if current is None else current, 0
+                            ),
+                            key=f"mark_{i}_{item}",
+                            horizontal=True,
+                        )
 
-    b1, b2, b3 = st.columns(3)
-    with b1:
-        if st.button("🔄 Refresh Now", use_container_width=True):
+                        if choice == "✅ Meets it":
+                            t["marks"][item] = True
+                            hits += 1
+                            any_judged = True
+                        elif choice == "❌ Misses it":
+                            t["marks"][item] = False
+                            any_judged = True
+                        else:
+                            t["marks"][item] = None
+
+                    if any_judged:
+                        judged += 1
+                        if hits == len(RUBRIC):
+                            full_match += 1
+
+        if judged:
+            st.markdown(
+                flat_html(f"""
+                <div class="moral-box">
+                    <b>{full_match} of {judged} judged teams</b> happened to satisfy
+                    every rubric item — purely by chance, since nobody knew the
+                    rubric while drawing. Notice how different the houses look
+                    even though every team heard the exact same instruction.
+                    <br><br>
+                    This is what happens when a learning outcome isn't defined
+                    <i>before</i> the activity starts: effort and creativity go
+                    into the task, but not necessarily toward the thing that
+                    will actually be assessed. Aligning the outcome, the
+                    activity, and the assessment — in that order — is what the
+                    rest of today's game is about.
+                </div>
+                """),
+                unsafe_allow_html=True
+            )
+
+    st.divider()
+
+    c1, c2 = st.columns(2)
+
+    with c1:
+        if st.button("🔄 Refresh", use_container_width=True):
             st.rerun()
-    with b2:
-        if st.button("🗑️ Reset All Drawings", use_container_width=True):
-            reset_all()
-            st.rerun()
-    with b3:
+
+    with c2:
         if st.button("🏠 Home", use_container_width=True):
             st.session_state.page = "home"
             st.rerun()
 
 
-inject_css()
+def reset_all():
+    state["start_time"] = None
+    state["rubric_revealed"] = False
+
+    for i in range(1, 7):
+        teams[i].update({
+            "name": DEFAULT_TEAM_NAMES[i],
+            "submitted": False,
+            "image_b64": None,
+            "marks": {item: None for item in RUBRIC},
+        })
+
 
 if st.session_state.page == "home":
     home()
+
 elif st.session_state.page == "join":
     join()
+
 elif st.session_state.page == "draw":
-    draw_room()
-elif st.session_state.page == "presenter":
-    presenter()
+    draw_page()
+
+elif st.session_state.page == "facilitator":
+    facilitator()
