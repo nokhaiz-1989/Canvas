@@ -14,7 +14,12 @@ Run with:
     streamlit run outcome_drawing_icebreaker.py
 
 Needs one extra package beyond the base game:
-    pip install streamlit-drawable-canvas
+    pip install "streamlit-drawable-canvas[image]"
+
+Requires streamlit-drawable-canvas >= 0.10.0 and Streamlit >= 1.53. That
+version made image_data opt-in on st_canvas() -- reading it without passing
+return_image_data=True raises a RuntimeError, which is why the flag is set
+explicitly below.
 """
 
 import streamlit as st
@@ -305,6 +310,8 @@ def draw_page():
             height=CANVAS_HEIGHT,
             width=CANVAS_WIDTH,
             drawing_mode="freedraw",
+            return_image_data=True,  # required since streamlit-drawable-canvas 0.10.0,
+                                      # otherwise reading .image_data raises RuntimeError
             key=f"canvas_{team_id}",
         )
 
@@ -388,18 +395,29 @@ def facilitator():
     st.divider()
 
     # ---- Rubric reveal ----
-    st.subheader("📋 The rubric nobody saw")
+    # Nothing here names "rubric" or hints one exists until the facilitator
+    # actually clicks reveal -- this section stays projector-safe.
 
     if not state["rubric_revealed"]:
-        st.warning(
-            "Reveal this only once every team has submitted — that's the moment "
-            "the exercise lands."
-        )
-        if st.button("🎭 REVEAL THE RUBRIC", type="primary", use_container_width=True):
-            state["rubric_revealed"] = True
-            st.rerun()
+
+        submitted_count = sum(1 for tm in teams.values() if tm["submitted"])
+
+        if submitted_count < len(teams):
+            st.caption(
+                f"Waiting on {len(teams) - submitted_count} more team(s) "
+                "before moving on."
+            )
+        else:
+            if st.button(
+                "▶ Move on to the next step",
+                type="primary",
+                use_container_width=True
+            ):
+                state["rubric_revealed"] = True
+                st.rerun()
 
     else:
+        st.subheader("📋 The rubric nobody saw")
         st.markdown(
             flat_html(f"""
             <div class="rubric-box">
